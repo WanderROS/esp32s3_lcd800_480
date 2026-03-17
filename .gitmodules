@@ -1,3 +1,12 @@
 [submodule "lib/Adafruit_NeoPixel"]
 	path = lib/Adafruit_NeoPixel
 	url = https://github.com/adafruit/Adafruit_NeoPixel.git
+[submodule "lib/ESP32_IO_Expander"]
+	path = lib/ESP32_IO_Expander
+	url = https://github.com/esp-arduino-libs/ESP32_IO_Expander.git
+[submodule "lib/esp-lib-utils"]
+	path = lib/esp-lib-utils
+	url = https://github.com/esp-arduino-libs/esp-lib-utils.git
+[submodule "lib/ESP32_Display_Panel"]
+	path = lib/ESP32_Display_Panel
+	url = https://github.com/esp-arduino-libs/ESP32_Display_Panel.git
