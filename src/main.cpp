@@ -40,7 +40,7 @@ void setup() {
         int bytes_per_pixel = color_bits / 8;
 
         // 逐行绘制蓝色，避免一次性分配过大内存
-        uint8_t *line = (uint8_t *)heap_caps_malloc(w * bytes_per_pixel, MALLOC_CAP_DMA);
+        uint8_t *line = (uint8_t *)heap_caps_malloc(w * bytes_per_pixel, MALLOC_CAP_SPIRAM);
         if (line) {
             // 填充蓝色像素数据（RGB565: 0x001F）
             for (int i = 0; i < w; i++) {
@@ -66,10 +66,19 @@ void setup() {
     Serial.println("Setup done. Touch the screen...");
 }
 
+static unsigned long ledPrevMs = 0;
+static bool ledOn = false;
+
 void loop() {
-    // NeoPixel 闪烁
-    strip.setPixelColor(0, 255, 0, 0);
-    strip.show();
+    unsigned long now = millis();
+
+    // 每 1s 切换 LED 状态
+    if (now - ledPrevMs >= 1000) {
+        ledPrevMs = now;
+        ledOn = !ledOn;
+        strip.setPixelColor(0, ledOn ? strip.Color(255, 0, 0) : 0);
+        strip.show();
+    }
 
     // 读取触摸并串口打印
     auto touch = board->getTouch();
