@@ -7,7 +7,7 @@
 using namespace esp_panel::drivers;
 
 #define LVGL_PORT_TICK_PERIOD_MS        2
-#define LVGL_PORT_BUFFER_HEIGHT         20
+#define LVGL_PORT_BUFFER_HEIGHT         50
 #define LVGL_PORT_TASK_STACK_SIZE       (6 * 1024)
 #define LVGL_PORT_TASK_PRIORITY         2
 #define LVGL_PORT_TASK_MAX_DELAY_MS     500
@@ -15,11 +15,10 @@ using namespace esp_panel::drivers;
 
 static SemaphoreHandle_t lvgl_mux = nullptr;
 static TaskHandle_t lvgl_task_handle = nullptr;
-static esp_timer_handle_t lvgl_tick_timer = nullptr;
 
-static void tick_increment(void *arg)
+static uint32_t tick_get_cb(void)
 {
-    lv_tick_inc(LVGL_PORT_TICK_PERIOD_MS);
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
@@ -77,13 +76,8 @@ bool lvgl_port_init(LCD *lcd, Touch *tp)
 {
     lv_init();
 
-    // Tick
-    const esp_timer_create_args_t tick_args = {
-        .callback = &tick_increment,
-        .name = "lvgl_tick"
-    };
-    esp_timer_create(&tick_args, &lvgl_tick_timer);
-    esp_timer_start_periodic(lvgl_tick_timer, LVGL_PORT_TICK_PERIOD_MS * 1000);
+    // Tick — 使用 esp_timer 硬件时钟，LVGL 能正确计算 idle
+    lv_tick_set_cb(tick_get_cb);
 
     // Display
     int w = lcd->getFrameWidth();

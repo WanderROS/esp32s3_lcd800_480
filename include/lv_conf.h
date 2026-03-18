@@ -25,7 +25,7 @@
 /*====================
    HAL SETTINGS
  *====================*/
-#define LV_DEF_REFR_PERIOD  33
+#define LV_DEF_REFR_PERIOD  16
 #define LV_DPI_DEF 130
 
 /*=================
@@ -69,6 +69,14 @@
  * THEMES
  *==================*/
 #define LV_USE_THEME_DEFAULT 1
+
+/*==================
+ * OTHERS
+ *==================*/
+#define LV_USE_SYSMON               1
+#define LV_SYSMON_GET_IDLE          lv_timer_get_idle
+#define LV_USE_PERF_MONITOR         1
+#define LV_USE_PERF_MONITOR_POS     LV_ALIGN_TOP_RIGHT
 
 /*--END OF LV_CONF_H--*/
 
