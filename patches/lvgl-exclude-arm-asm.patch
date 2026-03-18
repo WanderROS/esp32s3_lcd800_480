@@ -1,0 +1,19 @@
+diff --git a/library.json b/library.json
+index 7bd96af23..dcc90a2bf 100644
+--- a/library.json
++++ b/library.json
+@@ -8,7 +8,13 @@
+ 		"url": "https://github.com/lvgl/lvgl.git"
+ 	},
+ 	"build": {
+-		"includeDir": "."
++		"includeDir": ".",
++		"srcDir": "src",
++		"srcFilter": [
++			"+<*>",
++			"-<draw/sw/blend/neon/*.S>",
++			"-<draw/sw/blend/helium/*.S>"
++		]
+ 	},
+ 	"license": "MIT",
+ 	"homepage": "https://lvgl.io",
