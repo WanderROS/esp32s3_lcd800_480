@@ -10,3 +10,6 @@
 [submodule "lib/ESP32_Display_Panel"]
 	path = lib/ESP32_Display_Panel
 	url = https://github.com/esp-arduino-libs/ESP32_Display_Panel.git
+[submodule "lib/lvgl"]
+	path = lib/lvgl
+	url = https://github.com/lvgl/lvgl.git
