@@ -64,6 +64,8 @@
 #define LV_USE_BAR      1
 #define LV_USE_SLIDER   1
 #define LV_USE_SWITCH   1
+#define LV_USE_IMAGE    1
+#define LV_USE_CANVAS   1
 
 /*==================
  * THEMES
