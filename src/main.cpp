@@ -19,6 +19,14 @@
 #include "aliyun_asr.h"
 #include "qwen_llm.h"
 #include "aliyun_tts.h"
+#include <Adafruit_NeoPixel.h>
+
+// ===== NeoPixel LED 配置 =====
+#define LED_PIN     4    // WS2812 数据引脚（根据实际硬件修改）
+#define LED_COUNT   1     // LED 灯珠数量
+static Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+static uint8_t led_r = 255, led_g = 0, led_b = 0;
+static uint8_t led_brightness = 128;
 
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
@@ -358,6 +366,137 @@ void audio_task(void *param) {
     }
 }
 
+// ===== LED 控制 =====
+static void led_update(void) {
+    strip.setBrightness(led_brightness);
+    for (int i = 0; i < LED_COUNT; i++) {
+        strip.setPixelColor(i, strip.Color(led_r, led_g, led_b));
+    }
+    strip.show();
+}
+
+// LED 弹窗 UI 对象
+static lv_obj_t *led_popup = NULL;
+
+static void led_close_cb(lv_event_t *e) {
+    if (led_popup) {
+        lv_obj_delete(led_popup);
+        led_popup = NULL;
+    }
+}
+
+// 用 user_data 区分 R/G/B 滑块
+static void led_rgb_slider_cb(lv_event_t *e) {
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int channel = (int)(intptr_t)lv_event_get_user_data(e);
+    uint8_t val = (uint8_t)lv_slider_get_value(slider);
+    if (channel == 0) led_r = val;
+    else if (channel == 1) led_g = val;
+    else led_b = val;
+    led_update();
+}
+
+static void led_brightness_cb(lv_event_t *e) {
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    led_brightness = (uint8_t)lv_slider_get_value(slider);
+    led_update();
+}
+
+// 创建一行：标签 + 滑块
+static lv_obj_t *create_led_slider_row(lv_obj_t *parent, const char *label_text,
+                                        lv_color_t accent, uint8_t init_val,
+                                        lv_event_cb_t cb, void *user_data,
+                                        const lv_font_t *font) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_style_text_color(lbl, accent, 0);
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_width(lbl, 30);
+
+    lv_obj_t *slider = lv_slider_create(row);
+    lv_obj_set_flex_grow(slider, 1);
+    lv_obj_set_height(slider, 16);
+    lv_slider_set_range(slider, 0, 255);
+    lv_slider_set_value(slider, init_val, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x444466), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, accent, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, cb, LV_EVENT_VALUE_CHANGED, user_data);
+
+    return slider;
+}
+
+static void led_btn_cb(lv_event_t *e) {
+    if (led_popup) return;
+
+    lv_obj_t *scr = lv_screen_active();
+
+    led_popup = lv_obj_create(scr);
+    lv_obj_set_size(led_popup, 360, 320);
+    lv_obj_align(led_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(led_popup, lv_color_hex(0x2a2a4a), 0);
+    lv_obj_set_style_bg_opa(led_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(led_popup, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_border_width(led_popup, 2, 0);
+    lv_obj_set_style_radius(led_popup, 16, 0);
+    lv_obj_set_style_pad_all(led_popup, 20, 0);
+    lv_obj_set_flex_flow(led_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(led_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(led_popup, 12, 0);
+
+    const lv_font_t *f16 = g_font_cn_16 ? g_font_cn_16 : &lv_font_montserrat_16;
+    const lv_font_t *f14 = &lv_font_montserrat_14;
+
+    // 标题
+    lv_obj_t *title = lv_label_create(led_popup);
+    lv_label_set_text(title, "LED \xe7\x81\xaf\xe6\x8e\xa7\xe5\x88\xb6");  // "LED 灯控制"
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(title, f16, 0);
+
+    // R / G / B 滑块
+    create_led_slider_row(led_popup, "R", lv_color_hex(0xff4444), led_r,
+                          led_rgb_slider_cb, (void *)(intptr_t)0, f14);
+    create_led_slider_row(led_popup, "G", lv_color_hex(0x44ff44), led_g,
+                          led_rgb_slider_cb, (void *)(intptr_t)1, f14);
+    create_led_slider_row(led_popup, "B", lv_color_hex(0x4488ff), led_b,
+                          led_rgb_slider_cb, (void *)(intptr_t)2, f14);
+
+    // 亮度滑块
+    lv_obj_t *lbl_br = lv_label_create(led_popup);
+    lv_label_set_text(lbl_br, "\xe4\xba\xae\xe5\xba\xa6");  // "亮度"
+    lv_obj_set_style_text_color(lbl_br, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(lbl_br, f16, 0);
+
+    lv_obj_t *slider_br = lv_slider_create(led_popup);
+    lv_obj_set_width(slider_br, LV_PCT(100));
+    lv_obj_set_height(slider_br, 16);
+    lv_slider_set_range(slider_br, 0, 255);
+    lv_slider_set_value(slider_br, led_brightness, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider_br, lv_color_hex(0x444466), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider_br, lv_color_hex(0xffd700), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider_br, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_add_event_cb(slider_br, led_brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // 关闭按钮
+    lv_obj_t *btn_close = lv_button_create(led_popup);
+    lv_obj_set_size(btn_close, 100, 40);
+    lv_obj_set_style_bg_color(btn_close, lv_color_hex(0x444466), 0);
+    lv_obj_add_event_cb(btn_close, led_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_close = lv_label_create(btn_close);
+    lv_label_set_text(lbl_close, "\xe5\x85\xb3\xe9\x97\xad");  // "关闭"
+    lv_obj_set_style_text_font(lbl_close, f16, 0);
+    lv_obj_center(lbl_close);
+}
+
 // ===== 创建语音助手 UI（中文） =====
 static void create_voice_ui(void) {
     lv_obj_t *scr = lv_screen_active();
@@ -425,6 +564,19 @@ static void create_voice_ui(void) {
     lv_obj_set_style_text_color(g_lbl_hint, lv_color_hex(0x666688), 0);
     lv_obj_set_style_text_font(g_lbl_hint, f16, 0);
     lv_obj_align(g_lbl_hint, LV_ALIGN_BOTTOM_MID, 0, -20);
+
+    // LED 控制按钮（左上角）
+    lv_obj_t *btn_led = lv_button_create(scr);
+    lv_obj_set_size(btn_led, 70, 36);
+    lv_obj_align(btn_led, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_set_style_bg_color(btn_led, lv_color_hex(0x333355), 0);
+    lv_obj_set_style_radius(btn_led, 8, 0);
+    lv_obj_add_event_cb(btn_led, led_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_led = lv_label_create(btn_led);
+    lv_label_set_text(lbl_led, "LED");
+    lv_obj_set_style_text_color(lbl_led, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(lbl_led, f14, 0);
+    lv_obj_center(lbl_led);
 }
 
 // ===== setup =====
@@ -438,6 +590,11 @@ void setup() {
     } else {
         Serial.println("[SPIFFS] Init OK");
     }
+
+    // 初始化 NeoPixel LED
+    strip.begin();
+    strip.setBrightness(led_brightness);
+    strip.show();
 
     // 先用 Wire 初始化 I2C bus 0（SDA=8, SCL=18）
     // 触摸和音频 codec (ES8311/ES7210) 共用此总线
