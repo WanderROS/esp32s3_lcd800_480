@@ -87,8 +87,9 @@ bool lvgl_port_init(LCD *lcd, Touch *tp)
     lv_display_set_flush_cb(disp, flush_cb);
 
     uint32_t buf_size = w * LVGL_PORT_BUFFER_HEIGHT * sizeof(lv_color16_t);
-    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // RGB LCD 可以用 PSRAM buffer，释放内部 RAM 给 SR 模型
+    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     lv_display_set_buffers(disp, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     // 非 RGB LCD 需要 draw finish 回调

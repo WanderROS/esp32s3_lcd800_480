@@ -1,280 +1,390 @@
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
-#include "Adafruit_NeoPixel.h"
 #include "lvgl_port.h"
-#include <math.h>
+#include <Wire.h>
+#include "ESP_I2S.h"
+#include "esp_check.h"
+#include "es8311.h"
+#include "es7210.h"
+#include "ESP_SR.h"
+#include "esp_partition.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+#include "pin_config.h"
+#include "wifi_config.h"
+#include "aliyun_asr.h"
+#include "qwen_llm.h"
+#include "aliyun_tts.h"
 
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
 
-#define LED_PIN    4
-#define NUM_LEDS   1
+// ===== 唤醒词命令 =====
+static const sr_cmd_t sr_commands[] = {};
 
-/* 色轮参数 */
-#define CW_DIAMETER  440
-#define CW_RADIUS    (CW_DIAMETER / 2)
+// ===== 状态机 =====
+enum VoiceState {
+    STATE_IDLE,
+    STATE_RECORDING,
+    STATE_ASR,
+    STATE_LLM,
+    STATE_TTS,
+};
 
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+static volatile VoiceState voice_state = STATE_IDLE;
+static volatile bool wake_detected = false;
+
+// ===== 音频配置 =====
+#define EXAMPLE_SAMPLE_RATE     16000
+#define EXAMPLE_VOICE_VOLUME    75
+#define EXAMPLE_ES8311_MIC_GAIN (es8311_mic_gain_t)(6)
+#define EXAMPLE_ES7210_MIC_GAIN GAIN_30DB
+#define RECORD_TIME_SEC         6
+#define RECORD_BUFFER_SIZE      (EXAMPLE_SAMPLE_RATE * RECORD_TIME_SEC)
+
+I2SClass i2s;
+static int16_t *record_buffer = NULL;
+
 Board *board = nullptr;
 
-/* LED 颜色状态 */
-static uint8_t led_r = 255, led_g = 0, led_b = 0;
-static uint8_t led_brightness = 128;
-static bool    led_color_changed = true;
+// ===== UI 标签 =====
+static lv_obj_t *lbl_status = NULL;
+static lv_obj_t *lbl_asr    = NULL;
+static lv_obj_t *lbl_reply  = NULL;
 
-/* UI 对象 */
-static lv_obj_t *color_panel   = nullptr;
-static lv_obj_t *canvas        = nullptr;
-static lv_obj_t *knob          = nullptr;
-static lv_obj_t *preview_box   = nullptr;
-static lv_obj_t *slider_bright = nullptr;
-
-/* canvas 缓冲区 (RGB565, 2 bytes/pixel) */
-static uint8_t *cbuf = nullptr;
-
-/* ========== HSV → RGB ========== */
-static void hsv_to_rgb(float h, float s, float v,
-                       uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    float c = v * s;
-    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
-    float m = v - c;
-    float rf, gf, bf;
-
-    if      (h < 60)  { rf = c; gf = x; bf = 0; }
-    else if (h < 120) { rf = x; gf = c; bf = 0; }
-    else if (h < 180) { rf = 0; gf = c; bf = x; }
-    else if (h < 240) { rf = 0; gf = x; bf = c; }
-    else if (h < 300) { rf = x; gf = 0; bf = c; }
-    else              { rf = c; gf = 0; bf = x; }
-
-    *r = (uint8_t)((rf + m) * 255.0f);
-    *g = (uint8_t)((gf + m) * 255.0f);
-    *b = (uint8_t)((bf + m) * 255.0f);
+// 线程安全的 UI 更新
+static void ui_set_status(const char *text) {
+    if (!lvgl_port_lock(100)) return;
+    if (lbl_status) lv_label_set_text(lbl_status, text);
+    lvgl_port_unlock();
+}
+static void ui_set_asr(const char *text) {
+    if (!lvgl_port_lock(100)) return;
+    if (lbl_asr) lv_label_set_text(lbl_asr, text);
+    lvgl_port_unlock();
+}
+static void ui_set_reply(const char *text) {
+    if (!lvgl_port_lock(100)) return;
+    if (lbl_reply) lv_label_set_text(lbl_reply, text);
+    lvgl_port_unlock();
 }
 
-/* ========== 绘制色轮到 canvas ========== */
-static void draw_color_wheel(void)
-{
-    for (int y = 0; y < CW_DIAMETER; y++) {
-        for (int x = 0; x < CW_DIAMETER; x++) {
-            float dx = x - CW_RADIUS;
-            float dy = y - CW_RADIUS;
-            float dist = sqrtf(dx * dx + dy * dy);
+// ===== ES8311 初始化 =====
+esp_err_t es8311_codec_init(void) {
+    es8311_handle_t es_handle = es8311_create(0, ES8311_ADDRRES_0);
+    ESP_RETURN_ON_FALSE(es_handle, ESP_FAIL, "ES8311", "create failed");
 
-            lv_color_t c;
-            if (dist > CW_RADIUS) {
-                c = lv_color_white();  /* 圆外区域用白色 */
-            } else {
-                float hue = atan2f(dy, dx) * (180.0f / M_PI) + 180.0f;
-                float sat = dist / (float)CW_RADIUS;
-                uint8_t r, g, b;
-                hsv_to_rgb(hue, sat, 1.0f, &r, &g, &b);
-                c = lv_color_make(r, g, b);
-            }
-            lv_canvas_set_px(canvas, x, y, c, LV_OPA_COVER);
+    const es8311_clock_config_t es_clk = {
+        .mclk_inverted = false,
+        .sclk_inverted = false,
+        .mclk_from_mclk_pin = true,
+        .mclk_frequency = EXAMPLE_SAMPLE_RATE * 256,
+        .sample_frequency = EXAMPLE_SAMPLE_RATE
+    };
+
+    ESP_ERROR_CHECK(es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
+    ESP_ERROR_CHECK(es8311_sample_frequency_config(es_handle, es_clk.mclk_frequency, es_clk.sample_frequency));
+    ESP_ERROR_CHECK(es8311_microphone_config(es_handle, false));
+    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, EXAMPLE_VOICE_VOLUME, NULL));
+    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, EXAMPLE_ES8311_MIC_GAIN));
+    return ESP_OK;
+}
+
+// ===== 录音函数 =====
+bool do_record(int16_t *out_buf, size_t samples) {
+    size_t stereo_bytes = samples * 2 * sizeof(int16_t);
+    int16_t *stereo = (int16_t *)heap_caps_malloc(stereo_bytes, MALLOC_CAP_SPIRAM);
+    if (!stereo) {
+        Serial.println("[REC] stereo buffer alloc failed");
+        return false;
+    }
+
+    size_t total_read = 0;
+    uint32_t deadline = millis() + (RECORD_TIME_SEC + 2) * 1000;
+    while (total_read < stereo_bytes && millis() < deadline) {
+        size_t n = i2s.readBytes((char *)stereo + total_read, stereo_bytes - total_read);
+        total_read += n;
+    }
+
+    for (size_t i = 0; i < samples; i++) {
+        out_buf[i] = stereo[i * 2];
+    }
+    heap_caps_free(stereo);
+    Serial.printf("[REC] done, read %d bytes\n", total_read);
+    return total_read > 0;
+}
+
+// ===== 音频任务 (Core 0) =====
+void audio_task(void *param) {
+    // I2S 初始化
+    // setPins(bclk, ws, dout, din, mclk)
+    //   dout = DOPIN (GPIO6, → ES8311 播放)
+    //   din  = DIPIN (GPIO15, ← ES7210 录音)
+    i2s.setPins(BCLKPIN, WSPIN, DOPIN, DIPIN, MCLKPIN);
+    if (!i2s.begin(I2S_MODE_STD, EXAMPLE_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT,
+                   I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+        Serial.println("[AUDIO] I2S init failed!");
+        vTaskDelete(NULL);
+    }
+
+    // I2C: Wire 已在 setup 中初始化，直接复用
+
+    if (es8311_codec_init() != ESP_OK) {
+        Serial.println("[AUDIO] ES8311 init failed!");
+        vTaskDelete(NULL);
+    }
+
+    audio_hal_codec_config_t es7210_cfg = {
+        .adc_input  = AUDIO_HAL_ADC_INPUT_ALL,
+        .dac_output = AUDIO_HAL_DAC_OUTPUT_ALL,
+        .codec_mode = AUDIO_HAL_CODEC_MODE_ENCODE,
+        .i2s_iface  = {
+            .mode    = AUDIO_HAL_MODE_SLAVE,
+            .fmt     = AUDIO_HAL_I2S_NORMAL,
+            .samples = AUDIO_HAL_16K_SAMPLES,
+            .bits    = AUDIO_HAL_BIT_LENGTH_16BITS
         }
+    };
+    if (es7210_adc_init(&Wire, &es7210_cfg) != ESP_OK) {
+        Serial.println("[AUDIO] ES7210 init failed!");
+        vTaskDelete(NULL);
+    }
+    es7210_mic_select((es7210_input_mics_t)(ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2));
+    es7210_adc_set_gain_all(EXAMPLE_ES7210_MIC_GAIN);
+    es7210_adc_ctrl_state(AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+
+    // 使能功放 PA (NS4150) — 通过 IO 扩展器 TCA9554 (0x20) 的 P0
+    {
+        #define TCA9554_ADDR  0x20
+        #define TCA9554_REG_OUTPUT  0x01  // Output port register
+        #define TCA9554_REG_CONFIG  0x03  // Configuration register (0=output, 1=input)
+
+        // 设置 P0 为输出
+        Wire.beginTransmission(TCA9554_ADDR);
+        Wire.write(TCA9554_REG_CONFIG);
+        Wire.write(0xFE);  // P0=output(0), P1-P7=input(1)
+        Wire.endTransmission();
+
+        // P0 输出高电平，使能功放
+        Wire.beginTransmission(TCA9554_ADDR);
+        Wire.write(TCA9554_REG_OUTPUT);
+        Wire.write(0x01);  // P0=HIGH
+        Wire.endTransmission();
+
+        Serial.println("[AUDIO] PA enabled via TCA9554 P0");
+    }
+
+    // 检查模型分区
+    const esp_partition_t *model_part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "model");
+    if (!model_part) {
+        Serial.println("[AUDIO] Model partition not found!");
+        vTaskDelete(NULL);
+    }
+    Serial.printf("[AUDIO] Model partition: 0x%x, %d bytes\n", model_part->address, model_part->size);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    static uint32_t s_free_talk_until = 0;
+
+    // ESP_SR 唤醒词检测
+    ESP_SR.onEvent([](sr_event_t event, int command_id, int phrase_id) {
+        switch (event) {
+            case SR_EVENT_WAKEWORD:
+                Serial.println("[SR] Wakeword detected!");
+                if (voice_state == STATE_IDLE && millis() < s_free_talk_until) {
+                    wake_detected = true;
+                }
+                break;
+            case SR_EVENT_WAKEWORD_CHANNEL:
+                Serial.printf("[SR] Wakeword channel %d verified!\n", command_id);
+                if (voice_state == STATE_IDLE) {
+                    wake_detected = true;
+                }
+                break;
+            case SR_EVENT_TIMEOUT:
+                Serial.println("[SR] Timeout");
+                ESP_SR.setMode(SR_MODE_WAKEWORD);
+                break;
+            default: break;
+        }
+    });
+
+    if (!ESP_SR.begin(i2s, sr_commands, 0, SR_CHANNELS_STEREO, SR_MODE_WAKEWORD)) {
+        Serial.println("[SR] ESP_SR init failed!");
+        vTaskDelete(NULL);
+    }
+    Serial.println("[SR] Waiting for wakeword...");
+    ui_set_status("Waiting for wakeword...");
+
+    record_buffer = (int16_t *)heap_caps_malloc(
+        RECORD_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!record_buffer) {
+        Serial.println("[AUDIO] Record buffer alloc failed!");
+        vTaskDelete(NULL);
+    }
+
+    #define FREE_TALK_TIMEOUT_MS 30000
+
+    while (1) {
+        if (wake_detected) {
+            wake_detected = false;
+            voice_state = STATE_RECORDING;
+
+            ESP_SR.setMode(SR_MODE_OFF);
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            Serial.println("\n===== Recording =====");
+            ui_set_status("Recording...");
+            ui_set_asr("");
+            ui_set_reply("");
+
+            bool rec_ok = do_record(record_buffer, RECORD_BUFFER_SIZE);
+            if (!rec_ok) {
+                ui_set_status("Record failed");
+                s_free_talk_until = 0;
+                voice_state = STATE_IDLE;
+                ESP_SR.setMode(SR_MODE_WAKEWORD);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+
+            // ASR
+            voice_state = STATE_ASR;
+            ui_set_status("Recognizing...");
+            String asr_text;
+            bool asr_ok = aliyun_asr_recognize(record_buffer, RECORD_BUFFER_SIZE, asr_text);
+            if (!asr_ok || asr_text.isEmpty()) {
+                s_free_talk_until = 0;
+                ui_set_status("Waiting for wakeword...");
+                voice_state = STATE_IDLE;
+                ESP_SR.setMode(SR_MODE_WAKEWORD);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+            Serial.printf("[ASR] %s\n", asr_text.c_str());
+            ui_set_asr(asr_text.c_str());
+
+            // LLM
+            voice_state = STATE_LLM;
+            ui_set_status("Thinking...");
+            String llm_reply;
+            bool llm_ok = qwen_chat(asr_text, llm_reply);
+            if (!llm_ok || llm_reply.isEmpty()) {
+                ui_set_status("Network error");
+                aliyun_tts_speak("Sorry, network error.");
+                s_free_talk_until = 0;
+                voice_state = STATE_IDLE;
+                ESP_SR.setMode(SR_MODE_WAKEWORD);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            Serial.printf("[LLM] %s\n", llm_reply.c_str());
+            ui_set_reply(llm_reply.c_str());
+
+            // TTS
+            voice_state = STATE_TTS;
+            ui_set_status("Speaking...");
+            aliyun_tts_speak(llm_reply);
+
+            // 免唤醒窗口
+            s_free_talk_until = millis() + FREE_TALK_TIMEOUT_MS;
+            ui_set_status("Continue talking (30s)...");
+            voice_state = STATE_IDLE;
+            ESP_SR.setMode(SR_MODE_WAKEWORD);
+            vTaskDelay(pdMS_TO_TICKS(800));
+            wake_detected = true;
+        }
+
+        if (s_free_talk_until > 0 && voice_state == STATE_IDLE) {
+            if (millis() >= s_free_talk_until) {
+                s_free_talk_until = 0;
+                ui_set_status("Waiting for wakeword...");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-/* ========== 从触摸坐标取色 ========== */
-static void pick_color_at(int32_t x, int32_t y)
-{
-    float dx = x - CW_RADIUS;
-    float dy = y - CW_RADIUS;
-    float dist = sqrtf(dx * dx + dy * dy);
-    if (dist > CW_RADIUS) return;  /* 圆外不响应 */
+// ===== 创建语音助手 UI =====
+static void create_voice_ui(void) {
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), 0);
 
-    float hue = atan2f(dy, dx) * (180.0f / M_PI) + 180.0f;
-    float sat = dist / (float)CW_RADIUS;
-    hsv_to_rgb(hue, sat, 1.0f, &led_r, &led_g, &led_b);
-    led_color_changed = true;
+    // 标题
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "AI Voice Assistant");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
-    /* 更新预览 */
-    if (preview_box) {
-        lv_obj_set_style_bg_color(preview_box, lv_color_make(led_r, led_g, led_b), 0);
-    }
-    /* 移动 knob 指示器 */
-    if (knob) {
-        lv_obj_set_pos(knob, x - 9, y - 9);
-        lv_obj_set_style_border_color(knob, lv_color_make(led_r, led_g, led_b), 0);
-    }
+    // 状态
+    lbl_status = lv_label_create(scr);
+    lv_label_set_text(lbl_status, "Initializing...");
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xffd700), 0);
+    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 60);
+
+    // 分隔线
+    lv_obj_t *line = lv_obj_create(scr);
+    lv_obj_set_size(line, 700, 2);
+    lv_obj_set_style_bg_color(line, lv_color_hex(0x444466), 0);
+    lv_obj_set_style_border_width(line, 0, 0);
+    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 100);
+
+    // ASR 标题
+    lv_obj_t *asr_title = lv_label_create(scr);
+    lv_label_set_text(asr_title, "You:");
+    lv_obj_set_style_text_color(asr_title, lv_color_hex(0x88aaff), 0);
+    lv_obj_set_style_text_font(asr_title, &lv_font_montserrat_16, 0);
+    lv_obj_align(asr_title, LV_ALIGN_TOP_LEFT, 30, 115);
+
+    lbl_asr = lv_label_create(scr);
+    lv_label_set_text(lbl_asr, "");
+    lv_label_set_long_mode(lbl_asr, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_asr, 700);
+    lv_obj_set_style_text_color(lbl_asr, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(lbl_asr, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_asr, LV_ALIGN_TOP_LEFT, 30, 140);
+
+    // AI 回复标题
+    lv_obj_t *reply_title = lv_label_create(scr);
+    lv_label_set_text(reply_title, "AI:");
+    lv_obj_set_style_text_color(reply_title, lv_color_hex(0x88ffaa), 0);
+    lv_obj_set_style_text_font(reply_title, &lv_font_montserrat_16, 0);
+    lv_obj_align(reply_title, LV_ALIGN_TOP_LEFT, 30, 220);
+
+    lbl_reply = lv_label_create(scr);
+    lv_label_set_text(lbl_reply, "");
+    lv_label_set_long_mode(lbl_reply, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_reply, 700);
+    lv_obj_set_style_text_color(lbl_reply, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(lbl_reply, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_reply, LV_ALIGN_TOP_LEFT, 30, 245);
+
+    // 底部提示
+    lv_obj_t *hint = lv_label_create(scr);
+    lv_label_set_text(hint, "Say 'Xiao Ai Tong Xue' to wake up");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x666688), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 }
 
-/* canvas 触摸事件 */
-static void canvas_event_cb(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code != LV_EVENT_PRESSING && code != LV_EVENT_CLICKED) return;
-
-    lv_indev_t *indev = lv_indev_active();
-    if (!indev) return;
-
-    lv_point_t point;
-    lv_indev_get_point(indev, &point);
-
-    /* 用 lv_obj_get_coords 获取 canvas 在屏幕上的绝对位置 */
-    lv_area_t coords;
-    lv_obj_get_coords(canvas, &coords);
-
-    int32_t cx = point.x - coords.x1;
-    int32_t cy = point.y - coords.y1;
-
-    if (cx >= 0 && cx < CW_DIAMETER && cy >= 0 && cy < CW_DIAMETER) {
-        pick_color_at(cx, cy);
-    }
-}
-
-/* 亮度 slider 事件 */
-static void bright_event_cb(lv_event_t *e)
-{
-    lv_obj_t *sl = (lv_obj_t *)lv_event_get_target(e);
-    led_brightness = (uint8_t)lv_slider_get_value(sl);
-    led_color_changed = true;
-}
-
-/* 关闭面板 */
-static void close_panel_cb(lv_event_t *e)
-{
-    if (color_panel) {
-        lv_obj_delete(color_panel);
-        color_panel = nullptr;
-        canvas = nullptr;
-        knob = nullptr;
-        preview_box = nullptr;
-        slider_bright = nullptr;
-    }
-    if (cbuf) {
-        free(cbuf);
-        cbuf = nullptr;
-    }
-}
-
-/* ========== 弹出色轮面板 ========== */
-static void btn_event_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (color_panel) return;
-
-    /* 面板铺满屏幕，横向三栏布局：左侧控制 | 中间色轮 | 右侧亮度 */
-    color_panel = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(color_panel, 800, 480);
-    lv_obj_set_pos(color_panel, 0, 0);
-    lv_obj_set_flex_flow(color_panel, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(color_panel, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(color_panel, 10, 0);
-    lv_obj_set_style_pad_column(color_panel, 10, 0);
-    lv_obj_set_style_radius(color_panel, 0, 0);
-    lv_obj_set_style_border_width(color_panel, 0, 0);
-    lv_obj_clear_flag(color_panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* ---- 左侧栏：预览色块 + OK 按钮 ---- */
-    lv_obj_t *left_col = lv_obj_create(color_panel);
-    lv_obj_set_size(left_col, 140, CW_DIAMETER);
-    lv_obj_set_flex_flow(left_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(left_col, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(left_col, 8, 0);
-    lv_obj_set_style_pad_row(left_col, 16, 0);
-    lv_obj_set_style_border_width(left_col, 0, 0);
-    lv_obj_set_style_bg_opa(left_col, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(left_col, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 颜色预览色块 */
-    preview_box = lv_obj_create(left_col);
-    lv_obj_set_size(preview_box, 120, 120);
-    lv_obj_set_style_radius(preview_box, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(preview_box, 2, 0);
-    lv_obj_set_style_border_color(preview_box, lv_color_hex(0xcccccc), 0);
-    lv_obj_set_style_bg_color(preview_box, lv_color_make(led_r, led_g, led_b), 0);
-
-    /* OK 按钮 */
-    lv_obj_t *close_btn = lv_btn_create(left_col);
-    lv_obj_set_size(close_btn, 120, 50);
-    lv_obj_add_event_cb(close_btn, close_panel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *close_lbl = lv_label_create(close_btn);
-    lv_label_set_text(close_lbl, "OK");
-    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_24, 0);
-    lv_obj_center(close_lbl);
-
-    /* ---- 中间：色轮 ---- */
-    lv_obj_t *cw_cont = lv_obj_create(color_panel);
-    lv_obj_set_size(cw_cont, CW_DIAMETER, CW_DIAMETER);
-    lv_obj_set_style_pad_all(cw_cont, 0, 0);
-    lv_obj_set_style_border_width(cw_cont, 0, 0);
-    lv_obj_set_style_bg_opa(cw_cont, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(cw_cont, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* Canvas */
-    cbuf = (uint8_t *)malloc(LV_CANVAS_BUF_SIZE(CW_DIAMETER, CW_DIAMETER,
-                                                  16, LV_DRAW_BUF_STRIDE_ALIGN));
-    if (!cbuf) {
-        Serial.println("Canvas buf alloc failed!");
-        lv_obj_delete(color_panel);
-        color_panel = nullptr;
-        return;
-    }
-
-    canvas = lv_canvas_create(cw_cont);
-    lv_canvas_set_buffer(canvas, cbuf, CW_DIAMETER, CW_DIAMETER, LV_COLOR_FORMAT_RGB565);
-    lv_obj_set_pos(canvas, 0, 0);
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(canvas, canvas_event_cb, LV_EVENT_PRESSING, NULL);
-    lv_obj_add_event_cb(canvas, canvas_event_cb, LV_EVENT_CLICKED, NULL);
-
-    draw_color_wheel();
-
-    /* Knob 指示器 */
-    knob = lv_obj_create(cw_cont);
-    lv_obj_set_size(knob, 18, 18);
-    lv_obj_set_style_radius(knob, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(knob, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(knob, 2, 0);
-    lv_obj_set_style_border_color(knob, lv_color_white(), 0);
-    lv_obj_clear_flag(knob, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(knob, CW_RADIUS - 9, CW_RADIUS - 9);
-
-    /* ---- 右侧栏：竖向亮度 slider ---- */
-    lv_obj_t *right_col = lv_obj_create(color_panel);
-    lv_obj_set_size(right_col, 80, CW_DIAMETER);
-    lv_obj_set_flex_flow(right_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(right_col, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(right_col, 8, 0);
-    lv_obj_set_style_pad_row(right_col, 8, 0);
-    lv_obj_set_style_border_width(right_col, 0, 0);
-    lv_obj_set_style_bg_opa(right_col, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(right_col, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *sun_icon = lv_label_create(right_col);
-    lv_label_set_text(sun_icon, LV_SYMBOL_IMAGE);
-    lv_obj_set_style_text_font(sun_icon, &lv_font_montserrat_24, 0);
-
-    slider_bright = lv_slider_create(right_col);
-    lv_slider_set_range(slider_bright, 0, 255);
-    lv_slider_set_value(slider_bright, led_brightness, LV_ANIM_OFF);
-    lv_obj_set_width(slider_bright, 20);
-    lv_obj_set_flex_grow(slider_bright, 1);
-    lv_obj_set_style_bg_color(slider_bright,
-                              lv_palette_main(LV_PALETTE_YELLOW), LV_PART_KNOB);
-    lv_obj_set_style_bg_color(slider_bright,
-                              lv_palette_main(LV_PALETTE_YELLOW), LV_PART_INDICATOR);
-    lv_obj_add_event_cb(slider_bright, bright_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-}
-
-/* ========== setup / loop ========== */
-void setup()
-{
+// ===== setup =====
+void setup() {
     Serial.begin(115200);
     delay(2000);
 
-    strip.begin();
-    strip.setBrightness(led_brightness);
-    strip.setPixelColor(0, strip.Color(led_r, led_g, led_b));
-    strip.show();
+    // 先用 Wire 初始化 I2C bus 0（SDA=8, SCL=18）
+    // 触摸和音频 codec (ES8311/ES7210) 共用此总线
+    // Board 的触摸 SKIP_INIT_HOST=1，不会重复安装驱动
+    Wire.begin(IIC_SDA, IIC_SCL);
 
+    // 初始化显示板（触摸复用 Wire 已初始化的 I2C host）
     board = new Board();
     if (!board->begin()) {
         Serial.println("Board init failed!");
@@ -284,31 +394,43 @@ void setup()
     auto backlight = board->getBacklight();
     if (backlight) backlight->on();
 
+    // LVGL 初始化
     lvgl_port_init(board->getLCD(), board->getTouch());
 
+    // 创建语音助手 UI
     lvgl_port_lock(-1);
-
-    lv_obj_t *btn = lv_btn_create(lv_screen_active());
-    lv_obj_set_size(btn, 200, 80);
-    lv_obj_center(btn);
-    lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, LV_SYMBOL_TINT " Pick Color");
-    lv_obj_center(label);
-
+    create_voice_ui();
     lvgl_port_unlock();
 
-    Serial.println("LVGL ready.");
+    // 连接 WiFi
+    Serial.printf("[WiFi] Connecting to %s ...\n", WIFI_SSID);
+    ui_set_status("Connecting WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    uint32_t wifi_timeout = millis() + 15000;
+    while (WiFi.status() != WL_CONNECTED && millis() < wifi_timeout) {
+        delay(200);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+        ui_set_status("WiFi connected");
+        // 禁用 WiFi 省电，防止 PHY 释放后 SR 占满内存导致无法重新分配
+        WiFi.setSleep(false);
+    } else {
+        Serial.println("\n[WiFi] Connection failed!");
+        ui_set_status("WiFi failed!");
+    }
+
+    Serial.printf("[MEM] Heap: %d, PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+
+    // 启动音频任务 (Core 0，因为 LVGL 任务在 Core 1)
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    xTaskCreatePinnedToCore(audio_task, "audio_task", 12288, NULL, 5, NULL, 0);
+
+    Serial.println("[SETUP] Init complete");
 }
 
-void loop()
-{
-    if (led_color_changed) {
-        led_color_changed = false;
-        strip.setBrightness(led_brightness);
-        strip.setPixelColor(0, strip.Color(led_r, led_g, led_b));
-        strip.show();
-    }
-    delay(50);
+// ===== loop =====
+void loop() {
+    delay(1000);
 }
