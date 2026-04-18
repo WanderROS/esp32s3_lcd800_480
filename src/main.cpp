@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
 
 #include "pin_config.h"
 #include "wifi_config.h"
@@ -54,6 +55,53 @@ Board *board = nullptr;
 static lv_obj_t *lbl_status = NULL;
 static lv_obj_t *lbl_asr    = NULL;
 static lv_obj_t *lbl_reply  = NULL;
+
+// ===== 中文字体 =====
+static lv_font_t *g_font_cn_16 = nullptr;
+static lv_font_t *g_font_cn_20 = nullptr;
+static lv_font_t *g_font_cn_24 = nullptr;
+
+// 需要在字体加载后更新字体的标签
+static lv_obj_t *g_lbl_title       = nullptr;
+static lv_obj_t *g_lbl_asr_title   = nullptr;
+static lv_obj_t *g_lbl_reply_title = nullptr;
+static lv_obj_t *g_lbl_hint        = nullptr;
+
+/**
+ * 从 SPIFFS 读取字体文件到 PSRAM，用 lv_binfont_create_from_buffer 加载
+ */
+static lv_font_t *load_font_from_spiffs(const char *path) {
+    File f = SPIFFS.open(path, FILE_READ);
+    if (!f) {
+        Serial.printf("[FONT] Failed to open: %s\n", path);
+        return nullptr;
+    }
+    f.seek(0, SeekEnd);
+    size_t fsize = f.position();
+    f.seek(0, SeekSet);
+    if (fsize == 0) {
+        f.close();
+        return nullptr;
+    }
+
+    // 分配到 PSRAM，字体数据需要在整个生命周期内保持有效
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        Serial.printf("[FONT] PSRAM alloc failed for %u bytes\n", (unsigned)fsize);
+        f.close();
+        return nullptr;
+    }
+
+    uint32_t t0 = millis();
+    size_t n = f.read(buf, fsize);
+    f.close();
+    Serial.printf("[FONT] %s: %u bytes, read %lu ms\n", path, (unsigned)n, millis() - t0);
+
+    uint32_t t1 = millis();
+    lv_font_t *font = lv_binfont_create_from_buffer(buf, n);
+    Serial.printf("[FONT] lv_binfont_create: %lu ms, font=%p\n", millis() - t1, font);
+    return font;
+}
 
 // 线程安全的 UI 更新
 static void ui_set_status(const char *text) {
@@ -218,7 +266,7 @@ void audio_task(void *param) {
         vTaskDelete(NULL);
     }
     Serial.println("[SR] Waiting for wakeword...");
-    ui_set_status("Waiting for wakeword...");
+    ui_set_status("\xe7\xad\x89\xe5\xbe\x85\xe5\x94\xa4\xe9\x86\x92...");  // "等待唤醒..."
 
     record_buffer = (int16_t *)heap_caps_malloc(
         RECORD_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -238,13 +286,13 @@ void audio_task(void *param) {
             vTaskDelay(pdMS_TO_TICKS(100));
 
             Serial.println("\n===== Recording =====");
-            ui_set_status("Recording...");
+            ui_set_status("\xe5\xbd\x95\xe9\x9f\xb3\xe4\xb8\xad...");  // "录音中..."
             ui_set_asr("");
             ui_set_reply("");
 
             bool rec_ok = do_record(record_buffer, RECORD_BUFFER_SIZE);
             if (!rec_ok) {
-                ui_set_status("Record failed");
+                ui_set_status("\xe5\xbd\x95\xe9\x9f\xb3\xe5\xa4\xb1\xe8\xb4\xa5");  // "录音失败"
                 s_free_talk_until = 0;
                 voice_state = STATE_IDLE;
                 ESP_SR.setMode(SR_MODE_WAKEWORD);
@@ -254,12 +302,12 @@ void audio_task(void *param) {
 
             // ASR
             voice_state = STATE_ASR;
-            ui_set_status("Recognizing...");
+            ui_set_status("\xe8\xaf\x86\xe5\x88\xab\xe4\xb8\xad...");  // "识别中..."
             String asr_text;
             bool asr_ok = aliyun_asr_recognize(record_buffer, RECORD_BUFFER_SIZE, asr_text);
             if (!asr_ok || asr_text.isEmpty()) {
                 s_free_talk_until = 0;
-                ui_set_status("Waiting for wakeword...");
+                ui_set_status("\xe7\xad\x89\xe5\xbe\x85\xe5\x94\xa4\xe9\x86\x92...");  // "等待唤醒..."
                 voice_state = STATE_IDLE;
                 ESP_SR.setMode(SR_MODE_WAKEWORD);
                 vTaskDelay(pdMS_TO_TICKS(200));
@@ -270,12 +318,12 @@ void audio_task(void *param) {
 
             // LLM
             voice_state = STATE_LLM;
-            ui_set_status("Thinking...");
+            ui_set_status("\xe6\x80\x9d\xe8\x80\x83\xe4\xb8\xad...");  // "思考中..."
             String llm_reply;
             bool llm_ok = qwen_chat(asr_text, llm_reply);
             if (!llm_ok || llm_reply.isEmpty()) {
-                ui_set_status("Network error");
-                aliyun_tts_speak("Sorry, network error.");
+                ui_set_status("\xe7\xbd\x91\xe7\xbb\x9c\xe9\x94\x99\xe8\xaf\xaf");  // "网络错误"
+                aliyun_tts_speak("\xe6\x8a\xb1\xe6\xad\x89\xef\xbc\x8c\xe7\xbd\x91\xe7\xbb\x9c\xe5\x87\xba\xe7\x8e\xb0\xe9\x97\xae\xe9\xa2\x98\xe3\x80\x82");  // "抱歉，网络出现问题。"
                 s_free_talk_until = 0;
                 voice_state = STATE_IDLE;
                 ESP_SR.setMode(SR_MODE_WAKEWORD);
@@ -287,12 +335,12 @@ void audio_task(void *param) {
 
             // TTS
             voice_state = STATE_TTS;
-            ui_set_status("Speaking...");
+            ui_set_status("\xe6\x92\xad\xe6\x94\xbe\xe4\xb8\xad...");  // "播放中..."
             aliyun_tts_speak(llm_reply);
 
             // 免唤醒窗口
             s_free_talk_until = millis() + FREE_TALK_TIMEOUT_MS;
-            ui_set_status("Continue talking (30s)...");
+            ui_set_status("\xe7\xbb\xa7\xe7\xbb\xad\xe8\xaf\xb4\xe8\xaf\x9d (30s)...");  // "继续说话 (30s)..."
             voice_state = STATE_IDLE;
             ESP_SR.setMode(SR_MODE_WAKEWORD);
             vTaskDelay(pdMS_TO_TICKS(800));
@@ -302,7 +350,7 @@ void audio_task(void *param) {
         if (s_free_talk_until > 0 && voice_state == STATE_IDLE) {
             if (millis() >= s_free_talk_until) {
                 s_free_talk_until = 0;
-                ui_set_status("Waiting for wakeword...");
+                ui_set_status("\xe7\xad\x89\xe5\xbe\x85\xe5\x94\xa4\xe9\x86\x92...");  // "等待唤醒..."
             }
         }
 
@@ -310,74 +358,86 @@ void audio_task(void *param) {
     }
 }
 
-// ===== 创建语音助手 UI =====
+// ===== 创建语音助手 UI（中文） =====
 static void create_voice_ui(void) {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), 0);
 
+    const lv_font_t *f24 = g_font_cn_24 ? g_font_cn_24 : &lv_font_montserrat_24;
+    const lv_font_t *f16 = g_font_cn_16 ? g_font_cn_16 : &lv_font_montserrat_16;
+    const lv_font_t *f14 = &lv_font_montserrat_14;
+
     // 标题
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "AI Voice Assistant");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x00d4ff), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    g_lbl_title = lv_label_create(scr);
+    lv_label_set_text(g_lbl_title, "AI \xe8\xaf\xad\xe9\x9f\xb3\xe5\x8a\xa9\xe6\x89\x8b");  // "AI 语音助手"
+    lv_obj_set_style_text_color(g_lbl_title, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(g_lbl_title, f24, 0);
+    lv_obj_align(g_lbl_title, LV_ALIGN_TOP_MID, 0, 20);
 
     // 状态
     lbl_status = lv_label_create(scr);
-    lv_label_set_text(lbl_status, "Initializing...");
+    lv_label_set_text(lbl_status, "\xe7\xad\x89\xe5\xbe\x85\xe5\x94\xa4\xe9\x86\x92...");  // "等待唤醒..."
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xffd700), 0);
-    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl_status, f16, 0);
     lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 60);
 
     // 分隔线
     lv_obj_t *line = lv_obj_create(scr);
-    lv_obj_set_size(line, 700, 2);
+    lv_obj_set_size(line, 740, 2);
     lv_obj_set_style_bg_color(line, lv_color_hex(0x444466), 0);
     lv_obj_set_style_border_width(line, 0, 0);
     lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 100);
 
     // ASR 标题
-    lv_obj_t *asr_title = lv_label_create(scr);
-    lv_label_set_text(asr_title, "You:");
-    lv_obj_set_style_text_color(asr_title, lv_color_hex(0x88aaff), 0);
-    lv_obj_set_style_text_font(asr_title, &lv_font_montserrat_16, 0);
-    lv_obj_align(asr_title, LV_ALIGN_TOP_LEFT, 30, 115);
+    g_lbl_asr_title = lv_label_create(scr);
+    lv_label_set_text(g_lbl_asr_title, "\xe4\xbd\xa0\xe8\xaf\xb4\xef\xbc\x9a");  // "你说："
+    lv_obj_set_style_text_color(g_lbl_asr_title, lv_color_hex(0x88aaff), 0);
+    lv_obj_set_style_text_font(g_lbl_asr_title, f16, 0);
+    lv_obj_align(g_lbl_asr_title, LV_ALIGN_TOP_LEFT, 30, 115);
 
     lbl_asr = lv_label_create(scr);
     lv_label_set_text(lbl_asr, "");
     lv_label_set_long_mode(lbl_asr, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl_asr, 700);
+    lv_obj_set_width(lbl_asr, 740);
     lv_obj_set_style_text_color(lbl_asr, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(lbl_asr, &lv_font_montserrat_16, 0);
-    lv_obj_align(lbl_asr, LV_ALIGN_TOP_LEFT, 30, 140);
+    lv_obj_set_style_text_font(lbl_asr, f16, 0);
+    lv_obj_align(lbl_asr, LV_ALIGN_TOP_LEFT, 30, 145);
 
     // AI 回复标题
-    lv_obj_t *reply_title = lv_label_create(scr);
-    lv_label_set_text(reply_title, "AI:");
-    lv_obj_set_style_text_color(reply_title, lv_color_hex(0x88ffaa), 0);
-    lv_obj_set_style_text_font(reply_title, &lv_font_montserrat_16, 0);
-    lv_obj_align(reply_title, LV_ALIGN_TOP_LEFT, 30, 220);
+    g_lbl_reply_title = lv_label_create(scr);
+    lv_label_set_text(g_lbl_reply_title, "AI\xef\xbc\x9a");  // "AI："
+    lv_obj_set_style_text_color(g_lbl_reply_title, lv_color_hex(0x88ffaa), 0);
+    lv_obj_set_style_text_font(g_lbl_reply_title, f16, 0);
+    lv_obj_align(g_lbl_reply_title, LV_ALIGN_TOP_LEFT, 30, 230);
 
     lbl_reply = lv_label_create(scr);
     lv_label_set_text(lbl_reply, "");
     lv_label_set_long_mode(lbl_reply, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl_reply, 700);
+    lv_obj_set_width(lbl_reply, 740);
     lv_obj_set_style_text_color(lbl_reply, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(lbl_reply, &lv_font_montserrat_16, 0);
-    lv_obj_align(lbl_reply, LV_ALIGN_TOP_LEFT, 30, 245);
+    lv_obj_set_style_text_font(lbl_reply, f16, 0);
+    lv_obj_align(lbl_reply, LV_ALIGN_TOP_LEFT, 30, 260);
 
     // 底部提示
-    lv_obj_t *hint = lv_label_create(scr);
-    lv_label_set_text(hint, "Say 'Xiao Ai Tong Xue' to wake up");
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x666688), 0);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
+    g_lbl_hint = lv_label_create(scr);
+    lv_label_set_text(g_lbl_hint,
+        "\xe8\xaf\xb4 '\xe5\xb0\x8f\xe7\x88\xb1\xe5\x90\x8c\xe5\xad\xa6' \xe5\x94\xa4\xe9\x86\x92");  // "说 '小爱同学' 唤醒"
+    lv_obj_set_style_text_color(g_lbl_hint, lv_color_hex(0x666688), 0);
+    lv_obj_set_style_text_font(g_lbl_hint, f16, 0);
+    lv_obj_align(g_lbl_hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 }
 
 // ===== setup =====
 void setup() {
     Serial.begin(115200);
     delay(2000);
+
+    // SPIFFS 初始化（字体文件）
+    if (!SPIFFS.begin(true)) {
+        Serial.println("[SPIFFS] Init failed!");
+    } else {
+        Serial.println("[SPIFFS] Init OK");
+    }
 
     // 先用 Wire 初始化 I2C bus 0（SDA=8, SCL=18）
     // 触摸和音频 codec (ES8311/ES7210) 共用此总线
@@ -397,14 +457,24 @@ void setup() {
     // LVGL 初始化
     lvgl_port_init(board->getLCD(), board->getTouch());
 
-    // 创建语音助手 UI
+    // 加载中文字体（从 SPIFFS → PSRAM → LVGL binfont）
+    Serial.println("[FONT] Loading Chinese fonts...");
+    uint32_t ft0 = millis();
+    lvgl_port_lock(-1);
+    g_font_cn_24 = load_font_from_spiffs("/fonts/cn24.bin");
+    g_font_cn_20 = load_font_from_spiffs("/fonts/cn20.bin");
+    g_font_cn_16 = load_font_from_spiffs("/fonts/cn16.bin");
+    lvgl_port_unlock();
+    Serial.printf("[FONT] All loaded in %lu ms\n", millis() - ft0);
+
+    // 创建语音助手 UI（使用已加载的中文字体）
     lvgl_port_lock(-1);
     create_voice_ui();
     lvgl_port_unlock();
 
     // 连接 WiFi
     Serial.printf("[WiFi] Connecting to %s ...\n", WIFI_SSID);
-    ui_set_status("Connecting WiFi...");
+    ui_set_status("\xe8\xbf\x9e\xe6\x8e\xa5 WiFi...");  // "连接 WiFi..."
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     uint32_t wifi_timeout = millis() + 15000;
     while (WiFi.status() != WL_CONNECTED && millis() < wifi_timeout) {
@@ -413,12 +483,12 @@ void setup() {
     }
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
-        ui_set_status("WiFi connected");
+        ui_set_status("WiFi \xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5");  // "WiFi 已连接"
         // 禁用 WiFi 省电，防止 PHY 释放后 SR 占满内存导致无法重新分配
         WiFi.setSleep(false);
     } else {
         Serial.println("\n[WiFi] Connection failed!");
-        ui_set_status("WiFi failed!");
+        ui_set_status("WiFi \xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5!");  // "WiFi 连接失败!"
     }
 
     Serial.printf("[MEM] Heap: %d, PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());

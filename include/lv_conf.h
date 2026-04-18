@@ -80,6 +80,14 @@
 #define LV_USE_PERF_MONITOR         1
 #define LV_USE_PERF_MONITOR_POS     LV_ALIGN_TOP_RIGHT
 
+/*==================
+ * FILESYSTEM
+ *==================*/
+#define LV_USE_FS_MEMFS 1
+#if LV_USE_FS_MEMFS
+    #define LV_FS_MEMFS_LETTER 'M'
+#endif
+
 /*--END OF LV_CONF_H--*/
 
 #endif /*LV_CONF_H*/
