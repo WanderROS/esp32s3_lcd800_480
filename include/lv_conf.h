@@ -79,6 +79,7 @@
 #define LV_SYSMON_GET_IDLE          lv_timer_get_idle
 #define LV_USE_PERF_MONITOR         1
 #define LV_USE_PERF_MONITOR_POS     LV_ALIGN_TOP_RIGHT
+#define LV_USE_QRCODE              1
 
 /*==================
  * FILESYSTEM

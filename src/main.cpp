@@ -654,7 +654,9 @@ void setup() {
     ui_set_status("\xe8\x93\x9d\xe7\x89\x99\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad...");  // "蓝牙配网中..."
     ble_prov_start(false);
 
-    // 等待 WiFi 连接 (已配网过则几秒内连上，首次配网等待用户操作)
+    // 立即显示配网二维码，连接成功后自动隐藏
+    ble_prov_show_qr(g_font_cn_16);
+
     if (ble_prov_wait(BLE_PROV_TIMEOUT_MS)) {
         Serial.printf("[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
         ui_set_status("WiFi \xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5");  // "WiFi 已连接"
@@ -664,6 +666,8 @@ void setup() {
         Serial.println("[WiFi] BLE provisioning timeout or failed!");
         ui_set_status("\xe9\x85\x8d\xe7\xbd\x91\xe8\xb6\x85\xe6\x97\xb6\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe5\x90\xaf");  // "配网超时，请重启"
     }
+
+    ble_prov_hide_qr();
 
     Serial.printf("[MEM] Heap: %d, PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
 

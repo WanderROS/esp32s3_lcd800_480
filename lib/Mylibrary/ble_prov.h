@@ -16,6 +16,7 @@
 
 #include <WiFi.h>
 #include <WiFiProv.h>
+#include <lvgl.h>
 
 // ===== BLE 配网参数 =====
 #define BLE_PROV_POP          "12345678"       // Proof of Possession (配对密码)
@@ -26,6 +27,9 @@
 static volatile bool _prov_wifi_connected = false;
 static volatile bool _prov_failed = false;
 static volatile bool _prov_ended = false;
+
+// QR 码弹窗对象
+static lv_obj_t *_prov_qr_popup = NULL;
 
 /**
  * WiFi / Provisioning 事件回调
@@ -157,4 +161,82 @@ static void ble_prov_reset() {
     WiFi.disconnect(true, true);  // disconnect + erase NVS credentials
     delay(500);
     ESP.restart();
+}
+
+// lvgl_port_lock / unlock 声明
+#include "lvgl_port.h"
+
+/**
+ * 在屏幕上显示 BLE 配网二维码弹窗
+ * @param cn_font  中文字体指针 (如 g_font_cn_16)，为 NULL 时回退到内置字体
+ */
+static void ble_prov_show_qr(const lv_font_t *cn_font = NULL) {
+    // 构造与日志中一致的 QR payload
+    char qr_payload[256];
+    snprintf(qr_payload, sizeof(qr_payload),
+             "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\"}",
+             BLE_PROV_SERVICE_NAME, BLE_PROV_POP);
+
+    if (!lvgl_port_lock(200)) return;
+
+    if (_prov_qr_popup) {
+        lv_obj_delete(_prov_qr_popup);
+        _prov_qr_popup = NULL;
+    }
+
+    lv_obj_t *scr = lv_screen_active();
+
+    // 半透明遮罩 + 弹窗容器
+    _prov_qr_popup = lv_obj_create(scr);
+    lv_obj_set_size(_prov_qr_popup, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(_prov_qr_popup, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_bg_opa(_prov_qr_popup, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(_prov_qr_popup, 0, 0);
+    lv_obj_set_style_radius(_prov_qr_popup, 0, 0);
+    lv_obj_set_style_pad_all(_prov_qr_popup, 0, 0);
+    lv_obj_set_flex_flow(_prov_qr_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(_prov_qr_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(_prov_qr_popup, 12, 0);
+
+    const lv_font_t *f16 = cn_font ? cn_font : &lv_font_montserrat_16;
+
+    // 标题
+    lv_obj_t *title = lv_label_create(_prov_qr_popup);
+    lv_label_set_text(title, "\xe8\x93\x9d\xe7\x89\x99\xe9\x85\x8d\xe7\xbd\x91");  // "蓝牙配网"
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(title, f16, 0);
+
+    // QR 码
+    lv_obj_t *qr = lv_qrcode_create(_prov_qr_popup);
+    lv_qrcode_set_size(qr, 200);
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_qrcode_update(qr, qr_payload, strlen(qr_payload));
+
+    // 提示文字
+    lv_obj_t *hint1 = lv_label_create(_prov_qr_popup);
+    lv_label_set_text(hint1,
+        "\xe8\xaf\xb7\xe7\x94\xa8 ESP BLE Provisioning App \xe6\x89\xab\xe7\xa0\x81");  // "请用 ESP BLE Provisioning App 扫码"
+    lv_obj_set_style_text_color(hint1, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(hint1, f16, 0);
+
+    lv_obj_t *hint2 = lv_label_create(_prov_qr_popup);
+    lv_label_set_text_fmt(hint2, "PIN: %s", BLE_PROV_POP);
+    lv_obj_set_style_text_color(hint2, lv_color_hex(0xffd700), 0);
+    lv_obj_set_style_text_font(hint2, f16, 0);
+
+    lvgl_port_unlock();
+    Serial.println("[PROV] QR code displayed on screen");
+}
+
+/**
+ * 隐藏配网二维码弹窗
+ */
+static void ble_prov_hide_qr() {
+    if (!lvgl_port_lock(200)) return;
+    if (_prov_qr_popup) {
+        lv_obj_delete(_prov_qr_popup);
+        _prov_qr_popup = NULL;
+    }
+    lvgl_port_unlock();
 }
