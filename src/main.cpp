@@ -16,6 +16,7 @@
 
 #include "pin_config.h"
 #include "wifi_config.h"
+#include "ble_prov.h"
 #include "aliyun_asr.h"
 #include "qwen_llm.h"
 #include "aliyun_tts.h"
@@ -577,6 +578,21 @@ static void create_voice_ui(void) {
     lv_obj_set_style_text_color(lbl_led, lv_color_hex(0x00d4ff), 0);
     lv_obj_set_style_text_font(lbl_led, f14, 0);
     lv_obj_center(lbl_led);
+
+    // 清除配网按钮（右上角）
+    lv_obj_t *btn_prov = lv_button_create(scr);
+    lv_obj_set_size(btn_prov, 100, 36);
+    lv_obj_align(btn_prov, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_obj_set_style_bg_color(btn_prov, lv_color_hex(0x553333), 0);
+    lv_obj_set_style_radius(btn_prov, 8, 0);
+    lv_obj_add_event_cb(btn_prov, [](lv_event_t *e) {
+        ble_prov_reset();  // 清除 NVS 配网信息并重启
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_prov = lv_label_create(btn_prov);
+    lv_label_set_text(lbl_prov, "\xe9\x85\x8d\xe7\xbd\x91");  // "配网"
+    lv_obj_set_style_text_color(lbl_prov, lv_color_hex(0xff6666), 0);
+    lv_obj_set_style_text_font(lbl_prov, f16, 0);
+    lv_obj_center(lbl_prov);
 }
 
 // ===== setup =====
@@ -629,26 +645,31 @@ void setup() {
     create_voice_ui();
     lvgl_port_unlock();
 
-    // 连接 WiFi
-    Serial.printf("[WiFi] Connecting to %s ...\n", WIFI_SSID);
-    ui_set_status("\xe8\xbf\x9e\xe6\x8e\xa5 WiFi...");  // "连接 WiFi..."
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    uint32_t wifi_timeout = millis() + 15000;
-    while (WiFi.status() != WL_CONNECTED && millis() < wifi_timeout) {
-        delay(200);
-        Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    // ===== BLE 蓝牙配网 =====
+    // WiFiProv 会自动检查 NVS 中是否已有保存的凭据:
+    //   - 如果有: 直接用已保存的凭据连接 WiFi，不启动 BLE 广播
+    //   - 如果没有: 启动 BLE 广播，等待手机 App 发送凭据
+    // reset_prov = false 表示保留之前配网成功的凭据
+    Serial.println("[WiFi] Starting BLE provisioning manager...");
+    ui_set_status("\xe8\x93\x9d\xe7\x89\x99\xe9\x85\x8d\xe7\xbd\x91\xe4\xb8\xad...");  // "蓝牙配网中..."
+    ble_prov_start(false);
+
+    // 等待 WiFi 连接 (已配网过则几秒内连上，首次配网等待用户操作)
+    if (ble_prov_wait(BLE_PROV_TIMEOUT_MS)) {
+        Serial.printf("[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
         ui_set_status("WiFi \xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5");  // "WiFi 已连接"
         // 禁用 WiFi 省电，防止 PHY 释放后 SR 占满内存导致无法重新分配
         WiFi.setSleep(false);
     } else {
-        Serial.println("\n[WiFi] Connection failed!");
-        ui_set_status("WiFi \xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5!");  // "WiFi 连接失败!"
+        Serial.println("[WiFi] BLE provisioning timeout or failed!");
+        ui_set_status("\xe9\x85\x8d\xe7\xbd\x91\xe8\xb6\x85\xe6\x97\xb6\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe5\x90\xaf");  // "配网超时，请重启"
     }
 
     Serial.printf("[MEM] Heap: %d, PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+
+    // 等待 BLE 配网流程彻底结束，释放 BLE 栈内存给 ESP_SR 使用
+    ble_prov_wait_done();
+    Serial.printf("[MEM] After BLE release - Heap: %d, PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
 
     // 启动音频任务 (Core 0，因为 LVGL 任务在 Core 1)
     vTaskDelay(pdMS_TO_TICKS(1000));

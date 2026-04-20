@@ -1,8 +1,9 @@
 #pragma once
 
 // ===== WiFi 配置 =====
-#define WIFI_SSID     "Wander_6G"
-#define WIFI_PASSWORD "Wandering100"
+// WiFi 凭据已改为通过 BLE 蓝牙配网获取，不再硬编码
+// 使用手机 "ESP BLE Provisioning" App 进行配网
+// 配网成功后凭据自动保存到 NVS，下次重启自动连接
 
 // ===== 阿里云 ASR 配置 =====
 // 控制台: https://nls-portal.console.aliyun.com/
