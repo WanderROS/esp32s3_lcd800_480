@@ -21,6 +21,7 @@
 #include "qwen_llm.h"
 #include "aliyun_tts.h"
 #include <Adafruit_NeoPixel.h>
+#include "ramviewer.h"
 
 // ===== NeoPixel LED 配置 =====
 #define LED_PIN     4    // WS2812 数据引脚（根据实际硬件修改）
@@ -28,6 +29,20 @@
 static Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 static uint8_t led_r = 255, led_g = 0, led_b = 0;
 static uint8_t led_brightness = 128;
+
+// ===== RAMViewer Serial 适配 =====
+// 发送回调只负责写一个字节，不在回调中调用 rv_tx_complete()
+// 避免递归调用导致栈溢出重启
+static void rv_serial_send_byte(uint8_t byte) {
+    Serial.write(byte);
+}
+
+// 迭代驱动 TX：发送完一个字节后循环调用 rv_tx_complete() 直到发完
+static void rv_drain_tx(void) {
+    while (rv_is_tx_busy()) {
+        rv_tx_complete();
+    }
+}
 
 using namespace esp_panel::board;
 using namespace esp_panel::drivers;
@@ -600,6 +615,10 @@ void setup() {
     Serial.begin(115200);
     delay(2000);
 
+    // 初始化 RAMViewer
+    rv_init(rv_serial_send_byte);
+    Serial.printf("[RV] RAMViewer v%s initialized\n", rv_get_version());
+
     // SPIFFS 初始化（字体文件）
     if (!SPIFFS.begin(true)) {
         Serial.println("[SPIFFS] Init failed!");
@@ -684,5 +703,12 @@ void setup() {
 
 // ===== loop =====
 void loop() {
-    delay(1000);
+    // RAMViewer: 轮询串口接收数据
+    while (Serial.available()) {
+        uint8_t c = Serial.read();
+        rv_rx_byte(c);
+    }
+    // 驱动 RAMViewer 发送（rx_byte 处理完帧后会触发响应）
+    rv_drain_tx();
+    delay(1);
 }
